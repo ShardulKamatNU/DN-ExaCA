@@ -104,6 +104,7 @@ struct Inputs {
             nucleation.n_max = nucleation.n_max * pow(10, 12);
             nucleation.dtn = input_data["Nucleation"]["MeanUndercooling"];
             nucleation.dtsigma = input_data["Nucleation"]["StDev"];
+            nucleation.N0_filename = input_data["Nucleation"]["DensityFile"];
         }
 
         // Get interfacial response function coefficients and freezing range from the material input file

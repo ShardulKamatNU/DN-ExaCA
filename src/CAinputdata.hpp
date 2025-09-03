@@ -45,6 +45,7 @@ struct NucleationInputs {
     double n_max = 0.0;
     double dtn = 0.0;
     double dtsigma = 0.0;
+    std::string N0_filename = "";
 };
 
 struct InterfacialResponseInputs {

@@ -59,7 +59,13 @@ void runExaCA(int id, int np, Inputs inputs, Timers timers, Grid grid, Temperatu
     // counters - initialized with an estimate on the number of nuclei in the layer Without knowing
     // estimated_nuclei_this_rank_this_layer yet, initialize nucleation data structures to estimated sizes, resize
     // inside of placeNuclei when the number of nuclei per rank is known
-    int estimated_nuclei_this_rank_this_layer = inputs.nucleation.n_max * pow(grid.deltax, 3) * grid.domain_size;
+    //Shardul: since dynamic nucleation is specified by n_max < 0.0, added a conditional here
+    int estimated_nuclei_this_rank_this_layer;
+    if (inputs.nucleation.n_max < 0.0) {
+        estimated_nuclei_this_rank_this_layer = grid.domain_size;
+    } else {
+        estimated_nuclei_this_rank_this_layer = inputs.nucleation.n_max * pow(grid.deltax, 3) * grid.domain_size;
+    }
     Nucleation<memory_space> nucleation(estimated_nuclei_this_rank_this_layer, inputs.nucleation);
     // Fill in nucleation data structures, and assign nucleation undercooling values to potential nucleation events
     // Potential nucleation grains are only associated with liquid cells in layer 0 - they will be initialized for each

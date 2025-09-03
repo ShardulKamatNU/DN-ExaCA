@@ -11,7 +11,7 @@
 #include "CAinputs.hpp"
 #include "CAinterface.hpp"
 #include "CAtemperature.hpp"
-
+#include "CAnucparse.hpp" //Shardul: some helper functions to read csv text file as std::vector
 #include "mpi.h"
 
 #include <Kokkos_Core.hpp>
@@ -20,6 +20,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <numeric>
 
 // Data regarding nucleation events in the domain
 template <typename MemorySpace>
@@ -104,49 +105,152 @@ struct Nucleation {
         // Gaussian distribution of nucleation undercooling
         std::normal_distribution<double> nucleation_undercooling_dist(_inputs.dtn, _inputs.dtsigma);
 
+        // Shardul: Uniform distriution to realize nucleation probability
+        std::uniform_real_distribution<double> nucleation_chance_sampling(0.0,1.0);
+
         // Max number of nucleated grains in this layer
         // Use long int in intermediate steps calculating the number of nucleated grains, though the number should be
         // small enough to be stored as an int
         const double domain_volume = (grid.x_max - grid.x_min) * (grid.y_max - grid.y_min) *
                                      (grid.z_max_layer(layernumber) - grid.z_min_layer(layernumber));
         // If each cell underwent solidification 1x, the number of potential nuclei in the layer
-        const long int nuclei_this_layer_single_long = std::lround(_inputs.n_max * domain_volume);
+        long int nuclei_this_layer_single_long;
+        
+        // Shardul: number of nuclei For all solidification events
+        int nuclei_this_layer;
+
         // Multiplier for the number of nucleation events per layer, based on the max number of solidification events
         long int nuclei_multiplier_long = static_cast<long int>(max_solidification_events_host(layernumber));
-        long int nuclei_this_layer_long = nuclei_this_layer_single_long * nuclei_multiplier_long;
-        // Vector and view sizes should be type int for indexing and grain ID assignment purposes -
-        // Nuclei_ThisLayer_long should be less than INT_MAX
-        if (nuclei_this_layer_long > INT_MAX)
-            throw std::runtime_error("Error: Number of potential nucleation sites in the system exceeds the number of "
-                                     "valid GrainID; either nucleation density, the number of melt-solidification "
-                                     "events in the temperature data, or the domain size should be reduced");
-        int nuclei_this_layer_single = static_cast<int>(nuclei_this_layer_single_long);
-        int nuclei_this_layer = static_cast<int>(nuclei_this_layer_long);
         int nuclei_multiplier = static_cast<int>(nuclei_multiplier_long);
-
+    
+        //Shardul: vector to keep track of which nucleation probability realizations were successes
+        std::vector<int> nucleation_chance_realizations;
+        //Shardul: vector to keep track of how many nuclei per remelting event occured
+        std::vector<int> nuclei_this_layer_single_all(nuclei_multiplier_long);
+        
         // Nuclei Grain ID are assigned to avoid reusing values from previous layers
-        std::vector<int> nuclei_grain_id_whole_domain_v(nuclei_this_layer);
-        std::vector<double> nuclei_undercooling_whole_domain_v(nuclei_this_layer);
-        // Views for storing potential nucleated grain coordinates
-        view_type_int_host nuclei_x(Kokkos::ViewAllocateWithoutInitializing("NucleiX"), nuclei_this_layer);
-        view_type_int_host nuclei_y(Kokkos::ViewAllocateWithoutInitializing("NucleiY"), nuclei_this_layer);
-        view_type_int_host nuclei_z(Kokkos::ViewAllocateWithoutInitializing("NucleiZ"), nuclei_this_layer);
+        std::vector<int> nuclei_grain_id_whole_domain_v;
+        std::vector<double> nuclei_undercooling_whole_domain_v;
 
-        for (int meltevent = 0; meltevent < nuclei_multiplier; meltevent++) {
-            for (int n = 0; n < nuclei_this_layer_single; n++) {
-                int n_event = meltevent * nuclei_this_layer_single + n;
-                // Generate possible nuclei locations
-                double nuclei_x_unrounded = nucleation_site_dist_x(generator);
-                double nuclei_y_unrounded = nucleation_site_dist_y(generator);
-                double nuclei_z_unrounded = nucleation_site_dist_z(generator);
-                // Associate these locations with a specific cell on the grid
-                nuclei_x(n_event) = Kokkos::round((nuclei_x_unrounded - grid.x_min) / grid.deltax);
-                nuclei_y(n_event) = Kokkos::round((nuclei_y_unrounded - grid.y_min) / grid.deltax);
-                nuclei_z(n_event) = Kokkos::round((nuclei_z_unrounded - grid.z_min_layer[layernumber]) / grid.deltax);
-                // Assign each nuclei a Grain ID (negative values used for nucleated grains) and an undercooling
-                nuclei_grain_id_whole_domain_v[n_event] =
-                    -(nuclei_whole_domain + n_event + 1); // avoid using grain ID 0
-                nuclei_undercooling_whole_domain_v[n_event] = nucleation_undercooling_dist(generator);
+        // Views for storing potential nucleated grain coordinates
+        // Shardul: to be resized once nuclei_this_layer is known
+        view_type_int_host nuclei_x(Kokkos::ViewAllocateWithoutInitializing("NucleiX"), 0);
+        view_type_int_host nuclei_y(Kokkos::ViewAllocateWithoutInitializing("NucleiY"), 0);
+        view_type_int_host nuclei_z(Kokkos::ViewAllocateWithoutInitializing("NucleiZ"), 0);
+        
+        // Shardul: if n_max < 0.0, dynamic nucleation is used, n_max is obtained as a distribution from a file which has a value for every cell 
+        if (_inputs.n_max < 0.0) {
+            std::cout << "Using dynamic nucleation with distribution specified by file " << _inputs.N0_filename << std::endl;
+            CSVDoubleData n_maxCSV = readCSVDoubles(_inputs.N0_filename);
+            nuclei_this_layer_single_long = std::lround(grid.nx * grid.ny * grid.nz);
+            
+            long int nuclei_this_layer_long = nuclei_this_layer_single_long * nuclei_multiplier_long;
+            // Vector and view sizes should be type int for indexing and grain ID assignment purposes -
+            // Nuclei_ThisLayer_long should be less than INT_MAX
+            if (nuclei_this_layer_long > INT_MAX)
+                throw std::runtime_error("Error: Number of potential nucleation sites in the system exceeds the number of "
+                                        "valid GrainID; either nucleation density, the number of melt-solidification "
+                                        "events in the temperature data, or the domain size should be reduced");
+            nuclei_this_layer = static_cast<int>(nuclei_this_layer_long);
+            
+            //Shardul: for each melt event, we need to figure out which how many cells actually nucleate during which melt event
+            for (int meltevent = 0; meltevent < nuclei_multiplier; meltevent++) {
+                long int nucleation_chance_successes = 0;
+                for (int n = 0; n < nuclei_this_layer_single_long; n++) {
+                    int n_event = meltevent * nuclei_this_layer_single_long + n;
+                    //Shardul: nucleation chance for a cell is it's n_max times the cell volume
+                    if (nucleation_chance_sampling(generator) < n_maxCSV.rows[n][3] * pow(grid.deltax, 3)) {
+                        nucleation_chance_realizations.push_back(n);
+                        nucleation_chance_successes++;
+                    }
+                }
+                nuclei_this_layer_single_all[meltevent] = nucleation_chance_successes;
+            }
+            
+            //Shardul: now that we know exactly how many and which nuclei are realized, update quantities
+            nuclei_this_layer = std::accumulate(nuclei_this_layer_single_all.begin(),
+                                                nuclei_this_layer_single_all.end(),
+                                                0);
+            
+            //Shardul: resize these vectors now that nuclei_this_layer is known 
+            nuclei_grain_id_whole_domain_v.resize(nuclei_this_layer);
+            nuclei_undercooling_whole_domain_v.resize(nuclei_this_layer);
+
+            //Shardul: resize views for storing potential nucleated grain coordinates
+            Kokkos::realloc(Kokkos::WithoutInitializing, nuclei_x, nuclei_this_layer);
+            Kokkos::realloc(Kokkos::WithoutInitializing, nuclei_y, nuclei_this_layer);
+            Kokkos::realloc(Kokkos::WithoutInitializing, nuclei_z, nuclei_this_layer);
+
+            for (int meltevent = 0; meltevent < nuclei_multiplier; meltevent++){
+                int nuclei_this_layer_single = nuclei_this_layer_single_all[meltevent];
+                for(int n = 0; n < nuclei_this_layer_single; n++){
+                    int n_event = std::accumulate(nuclei_this_layer_single_all.begin(),
+                                                nuclei_this_layer_single_all.begin()+meltevent,
+                                                0) + n;
+                    
+                    // Generate possible nuclei locations
+                    double nuclei_x_unrounded = n_maxCSV.rows[nucleation_chance_realizations[n_event]][0];
+                    double nuclei_y_unrounded = n_maxCSV.rows[nucleation_chance_realizations[n_event]][1];
+                    double nuclei_z_unrounded = n_maxCSV.rows[nucleation_chance_realizations[n_event]][2];
+                    // Associate these locations with a specific cell on the grid
+                    nuclei_x(n_event) = Kokkos::round((nuclei_x_unrounded - grid.x_min) / grid.deltax);
+                    nuclei_y(n_event) = Kokkos::round((nuclei_y_unrounded - grid.y_min) / grid.deltax);
+                    nuclei_z(n_event) = Kokkos::round((nuclei_z_unrounded - grid.z_min_layer[layernumber]) / grid.deltax);
+                    // Assign each nuclei a Grain ID (negative values used for nucleated grains) and an undercooling
+                    nuclei_grain_id_whole_domain_v[n_event] =
+                         -(nuclei_whole_domain + n_event + 1); // avoid using grain ID 0
+                    nuclei_undercooling_whole_domain_v[n_event] = nucleation_undercooling_dist(generator);
+                }
+            }
+            
+
+        } else {
+            nuclei_this_layer_single_long = std::lround(_inputs.n_max * domain_volume);
+
+            long int nuclei_this_layer_long = nuclei_this_layer_single_long * nuclei_multiplier_long;
+            // Vector and view sizes should be type int for indexing and grain ID assignment purposes -
+            // Nuclei_ThisLayer_long should be less than INT_MAX
+            if (nuclei_this_layer_long > INT_MAX)
+                throw std::runtime_error("Error: Number of potential nucleation sites in the system exceeds the number of "
+                                        "valid GrainID; either nucleation density, the number of melt-solidification "
+                                        "events in the temperature data, or the domain size should be reduced");
+            nuclei_this_layer = static_cast<int>(nuclei_this_layer_long);
+
+            //since we are not using dynamic nucleation, set number of nuclei for each remelting event to be the same 
+            for (int meltevent = 0; meltevent < nuclei_multiplier; meltevent++) {
+                nuclei_this_layer_single_all[meltevent] = static_cast<int>(nuclei_this_layer_single_long);
+            }
+
+            //Shardul: resize these vectors now that nuclei_this_layer is known 
+            nuclei_grain_id_whole_domain_v.resize(nuclei_this_layer);
+            nuclei_undercooling_whole_domain_v.resize(nuclei_this_layer);
+
+            //Shardul: resize views for storing potential nucleated grain coordinates
+            Kokkos::realloc(Kokkos::WithoutInitializing, nuclei_x, nuclei_this_layer);
+            Kokkos::realloc(Kokkos::WithoutInitializing, nuclei_y, nuclei_this_layer);
+            Kokkos::realloc(Kokkos::WithoutInitializing, nuclei_z, nuclei_this_layer);
+            
+            for (int meltevent = 0; meltevent < nuclei_multiplier; meltevent++) {
+                int nuclei_this_layer_single = nuclei_this_layer_single_all[meltevent];
+                for (int n = 0; n < nuclei_this_layer_single; n++) {
+                    int n_event = std::accumulate(nuclei_this_layer_single_all.begin(),
+                                                 nuclei_this_layer_single_all.begin()+meltevent,
+                                                 0) + n;
+
+                    // Generate possible nuclei locations
+                    double nuclei_x_unrounded = nucleation_site_dist_x(generator);
+                    double nuclei_y_unrounded = nucleation_site_dist_y(generator);
+                    double nuclei_z_unrounded = nucleation_site_dist_z(generator);
+                    // Associate these locations with a specific cell on the grid
+                    nuclei_x(n_event) = Kokkos::round((nuclei_x_unrounded - grid.x_min) / grid.deltax);
+                    nuclei_y(n_event) = Kokkos::round((nuclei_y_unrounded - grid.y_min) / grid.deltax);
+                    nuclei_z(n_event) = Kokkos::round((nuclei_z_unrounded - grid.z_min_layer[layernumber]) / grid.deltax);
+                    // Assign each nuclei a Grain ID (negative values used for nucleated grains) and an undercooling
+                    nuclei_grain_id_whole_domain_v[n_event] =
+                         -(nuclei_whole_domain + n_event + 1); // avoid using grain ID 0
+                    
+                    nuclei_undercooling_whole_domain_v[n_event] = nucleation_undercooling_dist(generator);
+                }
             }
         }
 
@@ -160,7 +264,7 @@ struct Nucleation {
                       << std::endl;
         // Update number of nuclei counter for whole domain based on the number of nuclei in this layer
         nuclei_whole_domain += nuclei_this_layer;
-
+        
         // Loop through nuclei for this layer - each MPI rank storing the nucleation events that are possible (i.e,
         // nucleation event is associated with a CA cell on that MPI rank's subdomain, the cell is liquid type, and the
         // cell is associated with the current layer of the multilayer problem) Don't put nuclei in "ghost" cells -
@@ -169,8 +273,12 @@ struct Nucleation {
         // Store nucleation times as doubles to correctly order events in times, then convert to time steps later
         std::vector<double> nucleation_times_myrank_v(nuclei_this_layer);
         for (int meltevent = 0; meltevent < nuclei_multiplier; meltevent++) {
+            int nuclei_this_layer_single = nuclei_this_layer_single_all[meltevent];
             for (int n = 0; n < nuclei_this_layer_single; n++) {
-                int n_event = meltevent * nuclei_this_layer_single + n;
+                int n_event = std::accumulate(nuclei_this_layer_single_all.begin(),
+                                                 nuclei_this_layer_single_all.begin()+meltevent,
+                                                 0) + n;
+
                 if (((nuclei_y(n_event) > grid.y_offset) || (grid.at_south_boundary)) &&
                     ((nuclei_y(n_event) < grid.y_offset + grid.ny_local - 1) || (grid.at_north_boundary))) {
                     // Convert 3D location (using global X and Y coordinates) into a 1D location (using local X and Y
@@ -184,7 +292,6 @@ struct Nucleation {
                         // event is associated with one of the time periods during which the associated cell undergoes
                         // solidification
                         nuclei_location_myrank_v[possible_nuclei] = nuclei_location_this_layer;
-
                         double liq_time_this_event =
                             static_cast<double>(liquidus_time_host(nuclei_location_this_layer, meltevent, 1));
                         double cooling_rate_this_event =
@@ -315,6 +422,8 @@ struct Nucleation {
             }
         }
     }
+
+    void readNucleationData();
 };
 
 #endif
