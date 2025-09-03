@@ -3,6 +3,9 @@ An exascale-capable cellular automaton for nucleation and grain growth
 ExaCA is a cellular automata (CA) code for grain growth under additive
 manufacturing conditions, created by ExaAM within the Exascale Computing Project.
 
+#DN-ExaCA
+DN stands for Dynamic Nucleation. DN-ExaCA allows for a nucleation density field to be used instead of a single value nucleation density.
+
 ## License
 
 ExaCA is distributed under an [MIT license](LICENSE).
